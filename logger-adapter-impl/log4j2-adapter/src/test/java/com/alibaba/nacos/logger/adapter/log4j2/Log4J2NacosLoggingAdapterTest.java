@@ -185,34 +185,68 @@ class Log4J2NacosLoggingAdapterTest {
     }
     
     /**
-     * Test config change detection.
+     * Test appender removal detection (according to author's guidance).
      * 
-     * Scenario:
-     * 1. Load config without ASYNC_NAMING (disabled config)
-     * 2. Simulate config file change (by modifying lastConfigMd5)
-     * 3. Check should return true (need reload)
+     * This test simulates the real production scenario:
+     * 1. Nacos Client starts and loads its own logging config (nacos-log4j2.xml) with ASYNC_NAMING appender
+     * 2. Spring Cloud (or other framework) starts and reloads Log4j2 configuration
+     * 3. Spring Cloud's config doesn't include ASYNC_NAMING appender, so it gets removed
+     * 4. Nacos detects appender missing and reloads to restore it
      * 
-     * Note: We use disabled config to avoid Layer 1 fast path (ASYNC_NAMING check)
+     * Real scenario flow:
+     * - Nacos Client init -> load nacos-log4j2.xml -> ASYNC_NAMING appender added to context
+     * - Spring Cloud startup -> reload log4j2 config (e.g., log4j2-spring.xml) -> replaces entire config
+     * - New config doesn't have ASYNC_NAMING -> appender removed from context
+     * - Nacos reload task runs -> detects ASYNC_NAMING missing -> reloads nacos-log4j2.xml -> restores appender
+     * 
+     * This test aligns with author's guidance: focus on appender presence, not config file MD5.
      */
     @Test
     void testIsNeedReloadConfigurationConfigChanged() throws Exception {
-        // Use disabled config (no ASYNC_NAMING appender)
-        System.setProperty("nacos.logging.default.config.enabled", "false");
-        NacosLoggingProperties disabledProperties = new NacosLoggingProperties("classpath:nacos-log4j2.xml", System.getProperties());
+        // Step 1: Nacos Client loads its own config (simulating Nacos Client initialization)
+        // This is equivalent to: Nacos Client starts -> loads nacos-log4j2.xml -> ASYNC_NAMING appender added
+        log4J2NacosLoggingAdapter.loadConfiguration(nacosLoggingProperties);
+        verify(propertyChangeListener).propertyChange(any());
         
-        // Load config (actually won't load because disabled)
-        log4J2NacosLoggingAdapter.loadConfiguration(disabledProperties);
+        // Verify appender exists after Nacos loads its config
+        assertFalse(log4J2NacosLoggingAdapter.isNeedReloadConfiguration(), 
+                "Should not reload when appender exists after Nacos config loaded");
         
-        // First check - hasLoadedOnce=true, config unchanged, should return false
-        assertFalse(log4J2NacosLoggingAdapter.isNeedReloadConfiguration());
+        // Step 2: Simulate Spring Cloud (or other framework) reloading Log4j2 configuration
+        // In real scenario: Spring Cloud startup -> loads its own log4j2 config -> replaces entire Configuration
+        // Spring Cloud's config doesn't include ASYNC_NAMING, so it gets removed from context
+        // We simulate this by creating a new minimal configuration (like Spring Cloud would) without ASYNC_NAMING
+        org.apache.logging.log4j.core.LoggerContext loggerContext = 
+                (org.apache.logging.log4j.core.LoggerContext) org.apache.logging.log4j.LogManager.getContext(false);
+        org.apache.logging.log4j.core.config.Configuration originalConfig = loggerContext.getConfiguration();
         
-        // Simulate config change - modify lastConfigMd5 via reflection
-        java.lang.reflect.Field lastConfigMd5Field = Log4J2NacosLoggingAdapter.class.getDeclaredField("lastConfigMd5");
-        lastConfigMd5Field.setAccessible(true);
-        lastConfigMd5Field.set(log4J2NacosLoggingAdapter, "old-md5-value");
+        // Create a new minimal configuration without ASYNC_NAMING (simulating external framework reload)
+        org.apache.logging.log4j.core.config.builder.api.ConfigurationBuilder<?> builder = 
+                org.apache.logging.log4j.core.config.builder.api.ConfigurationBuilderFactory.newConfigurationBuilder();
+        builder.setStatusLevel(org.apache.logging.log4j.Level.ERROR);
+        builder.setConfigurationName("TestConfig");
         
-        // Check - config changed, Layer 2 should detect and return true
-        assertTrue(log4J2NacosLoggingAdapter.isNeedReloadConfiguration());
+        // Add a simple console appender (but not ASYNC_NAMING)
+        org.apache.logging.log4j.core.config.builder.api.AppenderComponentBuilder consoleAppender = builder
+                .newAppender("Console", "Console");
+        builder.add(consoleAppender);
+        
+        // Step 3: Replace the configuration (simulating Spring Cloud replacing Log4j2 config)
+        // This is what happens in real scenario: loggerContext.setConfiguration(springCloudConfig)
+        // The new config doesn't have ASYNC_NAMING, so it's effectively removed
+        org.apache.logging.log4j.core.config.Configuration newConfig = builder.build();
+        newConfig.start();
+        loggerContext.setConfiguration(newConfig);  // This replaces Nacos config, removing ASYNC_NAMING
+        loggerContext.updateLoggers();
+        
+        // Stop the old configuration (cleanup)
+        originalConfig.stop();
+        
+        // Step 4: Nacos reload task detects appender missing and triggers reload
+        // In real scenario: Nacos scheduled task runs -> isNeedReloadConfiguration() -> detects missing
+        // -> loadConfiguration() -> reloads nacos-log4j2.xml -> restores ASYNC_NAMING appender
+        assertTrue(log4J2NacosLoggingAdapter.isNeedReloadConfiguration(), 
+                "Should reload when appender is missing after Spring Cloud replaced the config");
     }
     
     /**

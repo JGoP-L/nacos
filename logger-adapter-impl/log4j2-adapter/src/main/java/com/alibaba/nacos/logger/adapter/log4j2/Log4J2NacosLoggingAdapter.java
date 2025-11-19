@@ -36,7 +36,6 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.net.URL;
 import java.util.Map;
-import java.util.Objects;
 
 /**
  * Support for Log4j version 2.7 or higher
@@ -74,6 +73,18 @@ public class Log4J2NacosLoggingAdapter implements NacosLoggingAdapter {
      */
     private volatile String lastConfigMd5 = null;
     
+    /**
+     * Track when ASYNC_NAMING appender was last seen in context.
+     * Used for diagnostic purposes to understand when appender disappears.
+     */
+    private volatile long lastSeenAppenderTime = 0;
+    
+    /**
+     * Track how many times we've detected appender missing after it was loaded.
+     * Used to identify if there's a pattern of appender removal.
+     */
+    private volatile int appenderMissingCount = 0;
+    
     @Override
     public boolean isAdaptedLogger(Class<?> loggerClass) {
         Class<?> expectedLoggerClass = getExpectedLoggerClass();
@@ -94,41 +105,175 @@ public class Log4J2NacosLoggingAdapter implements NacosLoggingAdapter {
         // This indicates Nacos configuration has been successfully loaded
         final LoggerContext loggerContext = (LoggerContext) LogManager.getContext(false);
         final Configuration contextConfiguration = loggerContext.getConfiguration();
+        
+        // Diagnostic: Collect all appender names for troubleshooting
+        java.util.Set<String> allAppenderNames = new java.util.HashSet<>();
+        
         for (Map.Entry<String, Appender> entry : contextConfiguration.getAppenders().entrySet()) {
-            if (APPENDER_MARK.equals(entry.getValue().getName())) {
+            String appenderName = entry.getValue().getName();
+            allAppenderNames.add(appenderName);
+            if (APPENDER_MARK.equals(appenderName)) {
                 // Nacos configuration is active, no reload needed
+                lastSeenAppenderTime = System.currentTimeMillis();
+                appenderMissingCount = 0; // Reset counter when appender is found
+                if (LOGGER.isTraceEnabled()) {
+                    LOGGER.trace("Found {} appender in context, no reload needed. All appenders: {}", 
+                            APPENDER_MARK, allAppenderNames);
+                }
                 return false;
             }
         }
         
-        // Layer 2: Check if configuration has been loaded before
+        // Layer 2: Appender not found - check if we need to reload
+        // This happens when:
+        // 1. Spring Cloud or other frameworks reload logging config and remove our appender
+        // 2. First time loading (hasLoadedOnce = false)
+        // 3. User disabled Nacos default config (handled by checking location)
+        // 4. User provided custom config without ASYNC_NAMING appender (handled by checking location)
+        
+        // Diagnostic logging: Log detailed information for troubleshooting
+        String currentLocation = getCurrentConfigLocation();
+        long currentTime = System.currentTimeMillis();
+        long timeSinceLastSeen = lastSeenAppenderTime > 0 ? currentTime - lastSeenAppenderTime : -1;
+        
+        // Increment missing count for diagnostic purposes
+        if (hasLoadedOnce) {
+            appenderMissingCount++;
+        }
+        
+        LOGGER.info("Checking if reload needed: appender={} not found, hasLoadedOnce={}, "
+                        + "currentLocation={}, lastConfigLocation={}, allAppenders={}, "
+                        + "appenderMissingCount={}, timeSinceLastSeen={}ms, contextConfigSource={}",
+                APPENDER_MARK, hasLoadedOnce, currentLocation, lastConfigLocation, allAppenderNames,
+                appenderMissingCount, timeSinceLastSeen, getContextConfigurationSource(contextConfiguration));
+        
         if (hasLoadedOnce) {
             // Configuration was loaded before but appender not found
-            // This means either:
-            // 1. User disabled Nacos default config
-            // 2. User provided custom config without ASYNC_NAMING appender
-            // 3. Configuration loading failed
+            // This likely means the appender was removed by external framework (e.g., Spring Cloud)
+            // We should reload to restore the appender, regardless of config file MD5
+            // because the purpose is to restore the appender, not to respond to config file changes
             
-            // Check if configuration file has changed by comparing MD5
-            String currentLocation = getCurrentConfigLocation();
-            String currentMd5 = calculateConfigMd5(currentLocation);
-            
-            // Only reload if location or content has changed
-            boolean locationChanged = !Objects.equals(currentLocation, lastConfigLocation);
-            boolean contentChanged = !Objects.equals(currentMd5, lastConfigMd5);
-            
-            if (locationChanged || contentChanged) {
-                LOGGER.info("Nacos logging configuration changed, will reload. Location changed: {}, Content changed: {}",
-                        locationChanged, contentChanged);
-                return true;
+            // If location is null or blank, it means config is disabled, don't reload
+            if (StringUtils.isBlank(currentLocation)) {
+                LOGGER.info("Config location is blank, config disabled. Will not reload.");
+                return false;
             }
             
-            // Configuration hasn't changed, no reload needed
-            return false;
+            // Appender is missing but we've loaded before - need to reload to restore it
+            // This is the core fix: reload when appender is removed, not just when config file changes
+            // According to author's guidance: we need to investigate WHY appender is missing
+            LOGGER.warn("Nacos appender {} not found in context but was loaded before. "
+                            + "This may indicate external framework (e.g., Spring Cloud) removed it. "
+                            + "Will reload to restore. All appenders in context: {}, "
+                            + "Thread: {}, StackTrace: {}, "
+                            + "ContextState: configSource={}, configName={}, started={}",
+                    APPENDER_MARK, allAppenderNames, Thread.currentThread().getName(),
+                    getStackTrace(), getContextConfigurationSource(contextConfiguration),
+                    contextConfiguration.getName(), contextConfiguration.isStarted());
+            
+            // Perform deep diagnostic check
+            performDeepDiagnostic(contextConfiguration, allAppenderNames);
+            
+            // Log diagnostic tool usage hint
+            LOGGER.info("To get detailed diagnostic information, call: "
+                    + "com.alibaba.nacos.logger.adapter.log4j2.Log4j2DiagnosticTool.diagnose(System.out)");
+            
+            return true;
         }
         
         // Layer 3: First time loading
+        LOGGER.info("First time loading, will load configuration. All appenders in context: {}", 
+                allAppenderNames);
         return true;
+    }
+    
+    /**
+     * Get current stack trace for diagnostic purposes.
+     * 
+     * @return stack trace string
+     */
+    private String getStackTrace() {
+        StackTraceElement[] stackTrace = Thread.currentThread().getStackTrace();
+        StringBuilder sb = new StringBuilder();
+        // Skip first 3 elements (getStackTrace, isNeedReloadConfiguration, caller)
+        int limit = Math.min(stackTrace.length, 10);
+        for (int i = 3; i < limit; i++) {
+            if (i > 3) {
+                sb.append(" <- ");
+            }
+            sb.append(stackTrace[i].getClassName())
+                    .append(".")
+                    .append(stackTrace[i].getMethodName())
+                    .append(":")
+                    .append(stackTrace[i].getLineNumber());
+        }
+        return sb.toString();
+    }
+    
+    /**
+     * Get context configuration source for diagnostic purposes.
+     * 
+     * @param configuration the configuration
+     * @return configuration source string
+     */
+    private String getContextConfigurationSource(Configuration configuration) {
+        try {
+            org.apache.logging.log4j.core.config.ConfigurationSource source = configuration.getConfigurationSource();
+            if (source != null) {
+                if (source.getFile() != null) {
+                    return "file:" + source.getFile().getAbsolutePath();
+                } else if (source.getURL() != null) {
+                    return "url:" + source.getURL().toString();
+                }
+            }
+            return "unknown";
+        } catch (Exception e) {
+            return "error:" + e.getMessage();
+        }
+    }
+    
+    /**
+     * Perform deep diagnostic check to understand why appender is missing.
+     * This method investigates the root cause according to author's guidance.
+     * 
+     * @param configuration the current configuration
+     * @param existingAppenders all existing appender names
+     */
+    private void performDeepDiagnostic(Configuration configuration, java.util.Set<String> existingAppenders) {
+        try {
+            // Check if configuration was recently changed/reloaded
+            LOGGER.debug("Deep diagnostic: Configuration name={}, started={}, "
+                            + "rootLogger={}, loggerCount={}, appenderCount={}",
+                    configuration.getName(), configuration.isStarted(),
+                    configuration.getRootLogger().getName(),
+                    configuration.getLoggers().size(),
+                    configuration.getAppenders().size());
+            
+            // Check if there are any listeners or watchers that might have modified the context
+            final LoggerContext loggerContext = (LoggerContext) LogManager.getContext(false);
+            LOGGER.debug("Deep diagnostic: LoggerContext name={}",
+                    loggerContext.getName());
+            
+            // Check if ASYNC_NAMING was ever added but then removed
+            // This would indicate external framework interference
+            if (appenderMissingCount > 1) {
+                LOGGER.warn("Deep diagnostic: ASYNC_NAMING appender has been missing {} times. "
+                                + "This suggests a pattern of appender removal, possibly by external framework. "
+                                + "Last seen {}ms ago.",
+                        appenderMissingCount, 
+                        lastSeenAppenderTime > 0 ? System.currentTimeMillis() - lastSeenAppenderTime : -1);
+            }
+            
+            // Log all appenders with their types for comparison
+            java.util.Map<String, String> appenderTypes = new java.util.HashMap<>();
+            for (Map.Entry<String, Appender> entry : configuration.getAppenders().entrySet()) {
+                appenderTypes.put(entry.getKey(), entry.getValue().getClass().getSimpleName());
+            }
+            LOGGER.debug("Deep diagnostic: All appenders with types: {}", appenderTypes);
+            
+        } catch (Exception e) {
+            LOGGER.warn("Error during deep diagnostic check: {}", e.getMessage(), e);
+        }
     }
     
     @Override
@@ -152,10 +297,19 @@ public class Log4J2NacosLoggingAdapter implements NacosLoggingAdapter {
     
     private void loadConfiguration(String location) {
         if (StringUtils.isBlank(location)) {
+            LOGGER.debug("Configuration location is blank, skipping load");
             return;
         }
         final LoggerContext loggerContext = (LoggerContext) LogManager.getContext(false);
         final Configuration contextConfiguration = loggerContext.getConfiguration();
+        
+        // Diagnostic: Log appenders before loading
+        java.util.Set<String> appendersBefore = new java.util.HashSet<>();
+        for (Appender appender : contextConfiguration.getAppenders().values()) {
+            appendersBefore.add(appender.getName());
+        }
+        LOGGER.info("Loading Nacos logging configuration from: {}. Appenders before load: {}", 
+                location, appendersBefore);
         
         // load and start nacos configuration
         Configuration configuration = loadConfiguration(loggerContext, location);
@@ -163,17 +317,66 @@ public class Log4J2NacosLoggingAdapter implements NacosLoggingAdapter {
         
         // append loggers and appenders to contextConfiguration
         Map<String, Appender> appenders = configuration.getAppenders();
+        java.util.Set<String> addedAppenders = new java.util.HashSet<>();
         for (Appender appender : appenders.values()) {
+            String appenderName = appender.getName();
             contextConfiguration.addAppender(appender);
+            addedAppenders.add(appenderName);
         }
         Map<String, LoggerConfig> loggers = configuration.getLoggers();
+        int addedLoggerCount = 0;
         for (String name : loggers.keySet()) {
             if (name.startsWith(NACOS_LOGGER_PREFIX)) {
                 contextConfiguration.addLogger(name, loggers.get(name));
+                addedLoggerCount++;
             }
         }
         
         loggerContext.updateLoggers();
+        
+        // Diagnostic: Log appenders after loading
+        java.util.Set<String> appendersAfter = new java.util.HashSet<>();
+        for (Appender appender : contextConfiguration.getAppenders().values()) {
+            appendersAfter.add(appender.getName());
+        }
+        boolean asycnNamingExists = appendersAfter.contains(APPENDER_MARK);
+        
+        // Update tracking when appender is successfully loaded
+        if (asycnNamingExists) {
+            lastSeenAppenderTime = System.currentTimeMillis();
+            appenderMissingCount = 0;
+        }
+        
+        LOGGER.info("Nacos logging configuration loaded. Added appenders: {}, Added loggers: {}, "
+                        + "ASYNC_NAMING exists: {}, All appenders after load: {}",
+                addedAppenders, addedLoggerCount, asycnNamingExists, appendersAfter);
+        
+        if (!asycnNamingExists) {
+            LOGGER.error("ASYNC_NAMING appender was not found after loading configuration from {}. "
+                            + "This indicates a serious configuration issue. "
+                            + "Expected appenders: {}, Actually added: {}, "
+                            + "Configuration file may be missing ASYNC_NAMING definition or loading failed.",
+                    location, appenders.keySet(), addedAppenders);
+            
+            // Deep diagnostic: Check if the configuration file actually contains ASYNC_NAMING
+            try {
+                URL url = ResourceUtils.getResourceUrl(location);
+                if (url != null) {
+                    String configContent = IoUtils.toString(url.openStream(), "UTF-8");
+                    boolean containsAsyncNaming = configContent.contains("ASYNC_NAMING") 
+                            || configContent.contains("name=\"ASYNC_NAMING\"");
+                    LOGGER.warn("Configuration file check: contains ASYNC_NAMING definition: {}", 
+                            containsAsyncNaming);
+                    if (!containsAsyncNaming) {
+                        LOGGER.error("Configuration file {} does not contain ASYNC_NAMING definition. "
+                                        + "This is the root cause of the issue.",
+                                location);
+                    }
+                }
+            } catch (Exception e) {
+                LOGGER.warn("Could not verify configuration file content: {}", e.getMessage());
+            }
+        }
     }
     
     private Configuration loadConfiguration(LoggerContext loggerContext, String location) {
