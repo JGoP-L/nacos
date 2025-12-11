@@ -43,4 +43,8 @@ public class Log4j2NacosLoggingPropertiesHolder {
         return null == INSTANCE.properties ? null : INSTANCE.properties.getValue(key, null);
     }
     
+    public static NacosLoggingProperties getProperties() {
+        return INSTANCE.properties;
+    }
+    
 }
